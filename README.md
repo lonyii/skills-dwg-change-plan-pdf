@@ -1,8 +1,10 @@
 # skills-dwg-change-plan-pdf
 
-**正式版 v1.1.0** — 核心流程已实现并经多样本验证（黑白矢量导出、SHX 字体修复、索引排版裁切、加字、单项工程合并、A4 自动分幅、尺寸判定）；新增整套图纸拼版布局的定位与手工裁切流程。
+**正式版 v1.2.0** — 核心流程已实现并经多样本验证（黑白矢量导出、索引排版裁切、加字、单项工程合并、A4 自动分幅、尺寸判定）。
 
-版本历史：v0.1.0-test（初始）→ v0.2.0-test（A4 分幅、尺寸判定、按编号配对）→ v1.0.0（正式版）→ v1.1.0（拼版布局：图框定位工具 + 手工 clip + A4 单幅输出）。
+**v1.2.0 重点**：新增 `--frame-print` 高分辨率图框打印模式（推荐）——按图框定位、放大打印后再裁 A4，从根源解决 SHX 文字黑块/线条过粗；不再做宋体替换，保留原始 SHX 大字体。
+
+版本历史：v0.1.0-test（初始）→ v0.2.0-test（A4 分幅、尺寸判定、按编号配对）→ v1.0.0（正式版）→ v1.1.0（拼版布局：图框定位工具 + 手工 clip + A4 单幅输出）→ v1.2.0（高分辨率图框打印，保留 SHX 字体，解决黑块）。
 
 DWG 施工图 + 竣工图 → **变更方案附图 PDF** 的 WorkBuddy 技能。
 
@@ -30,7 +32,13 @@ git clone https://github.com/lonyii/skills-dwg-change-plan-pdf.git ~/.workbuddy/
 
 ## 使用
 
-单对图纸：
+单对图纸（推荐 v1.2.0 高分辨率模式）：
+
+```bash
+python scripts/change_plan_pdf.py "施工图.dwg" "竣工图.dwg" --out-dir "输出目录" --frame-print --scale 4
+```
+
+传统模式（非拼版图纸）：
 
 ```bash
 python scripts/change_plan_pdf.py "施工图.dwg" "竣工图.dwg" --out-dir "输出目录"

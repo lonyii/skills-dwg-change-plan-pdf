@@ -27,7 +27,7 @@ pairs.json 格式（多对）：
 """
 from __future__ import annotations
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 import argparse
 import json
@@ -153,25 +153,36 @@ def fix_fonts(doc, verbose=False):
 
 def export_layout(doc, out_pdf: str, paper: str = "A1", plot_type: int = 1,
                   fix_shx: bool = False, code: Optional[str] = None,
-                  prefer: str = "总平面图", verbose=False) -> str:
+                  prefer: str = "总平面图", verbose=False,
+                  scale: float = 0, plot_origin=None) -> str:
     """把指定布局黑白导出为 PDF。plot_type=1(范围)是浩辰唯一可靠值，4(窗口)会导出空白。
 
     code 不为空时，优先选布局名含该工程编号的布局（一份 DWG 多工程图纸场景）。
     prefer 可覆盖默认布局偏好（用于 pairs.json 指定 sj_layout）。
+    scale > 0 时设 StandardScale（放大打印）：SHX 大字体清晰度取决于打印比例，
+    拼版图纸按图纸比例打印时目标图框只占页面一角，文字笔画因分辨率不足糊成黑块；
+    放大打印（如 4 倍）可让 SHX 输出为清晰矢量轮廓，再从结果中裁出图框。
+    plot_origin=(x_mm,y_mm) 配合 scale 使用。
     """
     import fitz
     media, rotation, _ = PAPER_MEDIA[paper]
     lay = find_layout(doc, prefer=prefer, code=code)
     if verbose:
-        print("  布局=%s 纸张=%s(%s) 旋转=%d" % (lay.Name, paper, media, rotation), flush=True)
+        print("  布局=%s 纸张=%s(%s) 旋转=%d 比例=%s" %
+              (lay.Name, paper, media, rotation, scale or "按图纸"), flush=True)
     lay.ConfigName = PDF_DRIVER
     lay.RefreshPlotDeviceInfo()
     lay.CanonicalMediaName = media
     lay.PlotRotation = rotation
     lay.StyleSheet = CTB
     lay.PlotType = plot_type
-    lay.StandardScale = 0
-    lay.CenterPlot = True
+    lay.StandardScale = scale
+    if scale and scale > 1:
+        lay.CenterPlot = False
+        if plot_origin:
+            lay.PlotOrigin = tuple(plot_origin)
+    else:
+        lay.CenterPlot = True
     if fix_shx:
         fix_fonts(doc, verbose)
     plot = doc.Plot
@@ -189,6 +200,61 @@ def export_layout(doc, out_pdf: str, paper: str = "A1", plot_type: int = 1,
     if verbose:
         print("  导出完成 %.0fKB, %d页, %s" % (os.path.getsize(out_pdf)/1024, pages, rect), flush=True)
     return out_pdf
+
+
+def detect_plan_frame(pdf_path: str, verbose=False, min_rects=1):
+    """在高比例放大打印的 PDF 中定位「平面图框」。
+
+    拼版图纸放大打印（StandardScale≈4）后，页面里可能同时有多个 A 系列横版
+    图框（平面图、设计说明、材料表…）。不能只按宽高比取最大——说明页常被误选。
+    判据：平面图框内有大量「矩形」实体（建筑物轮廓、图例方块），而设计说明页
+    几乎只有文字（矢量轮廓曲线），re 实体数接近 0。因此按「框内 re 实体数」
+    优先、面积次之来选。
+
+    返回 (x0,y0,x1,y1)；找不到返回 None。
+    """
+    import fitz
+    d = fitz.open(pdf_path)
+    p = d[0]
+    W, H = p.rect.width, p.rect.height
+
+    # 收集所有 "re"（矩形）实体，稍后按所在图框归类
+    rect_items = []
+    for g in p.get_drawings():
+        for it in g["items"]:
+            if it[0] == "re":
+                rect_items.append(it[1])   # fitz.Rect
+
+    cands = []
+    seen = set()
+    for g in p.get_drawings():
+        r = g["rect"]
+        w, h = r.width, r.height
+        if not (W*0.15 < w < W*0.92 and H*0.15 < h < H*0.92):
+            continue
+        ratio = w/h
+        # A 系列横版(~1.414)或竖版(~0.707)；竣工图在A2横框里、施工图常是竖版A4
+        if not (1.25 < ratio < 1.60 or 0.65 < ratio < 0.80):
+            continue
+        key = (round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+        if key in seen:
+            continue
+        seen.add(key)
+        nrects = sum(1 for rr in rect_items
+                     if r.x0 <= rr.x0 and r.y0 <= rr.y0 and rr.x1 <= r.x1 and rr.y1 <= r.y1)
+        cands.append((r.x0, r.y0, r.x1, r.y1, w*h, nrects))
+    d.close()
+    if not cands:
+        return None
+    # 先按 re 数量降序（平面图特征），同档按面积降序
+    cands.sort(key=lambda c: (-c[5], -c[4]))
+    best = cands[0]
+    if verbose:
+        for c in cands[:5]:
+            print("  候选框 %s 面积=%.0f 矩形数=%d" %
+                  (tuple(round(v) for v in c[:4]), c[4], c[5]), flush=True)
+        print("  → 选中: %s" % (tuple(round(v) for v in best[:4]),), flush=True)
+    return (best[0], best[1], best[2], best[3])
 
 
 def parse_clip(value) -> Optional[Tuple[float, float, float, float]]:
@@ -485,6 +551,91 @@ def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text:
     return sj_final, jg_final
 
 
+def process_frame_print(sj: str, jg: str, work: str, paper: str,
+                        sj_text: str, jg_text: str, scale: float = 4,
+                        origin=None, preview=False, verbose=False,
+                        sj_clip=None, jg_clip=None):
+    """【高分辨率图框打印模式】放大打印 → 定位目标图框 → 裁切到 A4。
+
+    原理：SHX 大字体糊成黑块的根因是打印比例太小、分辨率不够（目标图框在
+    整张 A1 拼版里只占一角）。把 StandardScale 放大（默认 4 倍）后，浩辰
+    会把 SHX 字形输出为清晰矢量轮廓；此时其它图框被推出页面，目标图框以
+    A 系列横版比例独占页面，用 detect_plan_frame() 自动定位后裁到 A4。
+
+    不用宋体替换——原 SHX 大字体原样保留，文字与线条粗细都正常。
+
+    返回 (设计页PDF, 变更页PDF)，均为 A4 单幅。
+    """
+    import fitz
+    pythoncom, app = _com()
+
+    def open_doc(path):
+        abs_path = os.path.abspath(path)
+        if not os.path.exists(abs_path):
+            raise FileNotFoundError("DWG 不可访问: %s" % abs_path)
+        for i in range(app.Documents.Count):
+            try:
+                if os.path.abspath(app.Documents.Item(i).FullName) == abs_path:
+                    return app.Documents.Item(i)
+            except Exception:
+                pass
+        last = None
+        for attempt in range(3):
+            try:
+                return app.Documents.Open(abs_path)
+            except Exception as e:
+                last = e; time.sleep(2)
+        raise last
+
+    results = {}
+    # 策略：优先 1:1（多数图纸文字本就清晰，如 J 盘样本）；
+    # 只有 1:1 找不到「平面图框」（有矩形特征）时，才按 scale 放大重打——
+    # 放大后其它图框被推出页面、目标框独占页面，SHX 也输出为清晰矢量。
+    for tag, path, text, label in [
+        ("sj", sj, sj_text, "设计方案1"),
+        ("jg", jg, jg_text, "变更方案1"),
+    ]:
+        manual_clip = sj_clip if tag == "sj" else jg_clip
+        raw = os.path.join(work, "%s_scaled.pdf" % tag)
+        out = os.path.join(work, "%s_final.pdf" % tag)
+        chosen = None
+        tried = []
+        # 施工图字体本来就清晰 → 1:1；竣工图黑块来自比例太小 → 先放大。
+        # 放大后若找不到「平面图框」（矩形特征），退回 1:1（如 J 盘样本图框本就够大）。
+        trial_scales = [0, scale, scale - 1] if tag == "sj" else [scale, scale - 1, 0]
+        for trial_scale in trial_scales:
+            if trial_scale < 0:
+                continue
+            d = open_doc(path)
+            try:
+                export_layout(d, raw, paper=paper, fix_shx=False, scale=trial_scale,
+                              plot_origin=(origin or (0, 0)) if trial_scale else None,
+                              verbose=verbose)
+            finally:
+                d.Close(False)
+            clip = manual_clip or detect_plan_frame(raw, verbose, min_rects=1)
+            tried.append((trial_scale, clip))
+            if clip:
+                chosen = (trial_scale, clip)
+                break
+        if not chosen:
+            trial_scale, clip = tried[-1]
+            chosen = (trial_scale, clip)
+            print("  ⚠ [%s] 未能自动定位平面图框，已用最后候选；建议用 --%s-clip 或 inspect_frames.py 指定" %
+                  (tag, tag), flush=True)
+        use_scale, clip = chosen
+        if verbose:
+            print("  [%s] 最终比例=%s clip=%s" % (tag, use_scale or "1:1",
+                  tuple(round(v) for v in clip) if clip else None), flush=True)
+        stamp_a4_single(raw, text, label, out, clip=clip)
+        results[tag] = out
+        if preview:
+            fitz.open(out)[0].get_pixmap(matrix=fitz.Matrix(0.6, 0.6)).save(
+                out.replace(".pdf", "_预览.png"))
+    pythoncom.CoUninitialize()
+    return results["sj"], results["jg"]
+
+
 def main():
     ap = argparse.ArgumentParser(description="施工图+竣工图 → 变更方案附图 PDF")
     ap.add_argument("dwg", nargs="*", help="施工图.dwg 竣工图.dwg（共两个）")
@@ -500,6 +651,11 @@ def main():
     ap.add_argument("--jg-clip", help="竣工图平面图的 raw PDF 裁切框 x0,y0,x1,y1（拼版布局用）")
     ap.add_argument("--a4-single", action="store_true",
                     help="拼版布局专用：把裁出的小平面图整幅放单张 A4，直接输出成品，不再走 split_to_a4 1:1 切分")
+    ap.add_argument("--frame-print", action="store_true",
+                    help="【推荐/高分辨率】放大打印定位目标图框再裁 A4：保留原始 SHX 大字体，彻底解决文字黑块/过粗；"
+                         "不用宋体替换。仅打印目标图框，不把整套拼版塞进一页")
+    ap.add_argument("--scale", type=float, default=4.0, help="--frame-print 的放大比例，默认 4")
+    ap.add_argument("--plot-origin", help="--frame-print 的打印原点 x_mm,y_mm（可选，默认不设）")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -548,11 +704,23 @@ def main():
         if args.verbose:
             print("  竣工图编号: %s | 施工图: %s" %
                   (code, os.path.basename(sj)), flush=True)
-        sj_final, jg_final = process_pair(
-            sj, jg, work, args.paper, args.sj_text, args.jg_text,
-            args.text_pos, args.preview, code=code, sj_layout=sj_layout,
-            verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
-            a4_single=args.a4_single)
+        if args.frame_print:
+            origin = None
+            if args.plot_origin:
+                try:
+                    origin = tuple(float(v) for v in args.plot_origin.replace("，", ",").split(","))
+                except ValueError:
+                    ap.error("--plot-origin 需为 x_mm,y_mm")
+            sj_final, jg_final = process_frame_print(
+                sj, jg, work, args.paper, args.sj_text, args.jg_text,
+                scale=args.scale, origin=origin, preview=args.preview,
+                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip)
+        else:
+            sj_final, jg_final = process_pair(
+                sj, jg, work, args.paper, args.sj_text, args.jg_text,
+                args.text_pos, args.preview, code=code, sj_layout=sj_layout,
+                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
+                a4_single=args.a4_single)
         merged = merge_pdfs([sj_final, jg_final], os.path.join(args.out_dir, out_name))
         if args.a4_single:
             print("完成（A4 单幅）: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
