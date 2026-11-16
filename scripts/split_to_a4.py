@@ -58,21 +58,54 @@ def stamp(page, text: str, size: int = 13):
     page.insert_text((x, y), text, fontname=FONT, fontsize=size, color=(0, 0, 0))
 
 
+def content_bbox(page, threshold=200, pad_pt=14):
+    """渲染缩略图找非白像素边界，映射回 PDF 坐标。
+
+    返回 (fitz.Rect, used_flag)。图纸内容偏在一角时，据此裁掉大片空白，
+    让内容铺满 A4、文字保持原始大小（清晰）；内容本就铺满时返回近整页。
+    """
+    import numpy as np
+    from PIL import Image
+    zoom = 0.5
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+    gray = img.mean(axis=2)
+    ys, xs = np.where(gray < threshold)
+    if len(xs) == 0:
+        return page.rect, False
+    x0, x1 = xs.min()/zoom, xs.max()/zoom
+    y0, y1 = ys.min()/zoom, ys.max()/zoom
+    r = fitz.Rect(max(0, x0-pad_pt), max(0, y0-pad_pt),
+                  min(page.rect.width, x1+pad_pt), min(page.rect.height, y1+pad_pt))
+    # 只有内容显著小于整页（面积 < 55%）时才认为需要裁空白；
+    # 否则一律按整页纸张分幅，避免边缘留白导致张数判定偏小（如 A1 被误判成 7 张）。
+    area_ratio = (r.width * r.height) / (page.rect.width * page.rect.height)
+    used = area_ratio < 0.55
+    return (r if used else page.rect), used
+
+
 def cut_pdf(src_pdf: str, label: str, out_pdf: str, verbose=False) -> int:
-    """把单个 PDF 的第一页切成多张 A4，逐张标注 label+序号。"""
+    """把单个 PDF 的第一页按内容区域切成多张 A4，逐张标注 label+序号。
+
+    1:1 矢量平铺、不缩放；自动裁掉内容外的大片空白，保证文字原始大小。
+    """
     src = fitz.open(src_pdf)
     sp = src[0]
-    cols, rows, aw, ah, n = split_spec(sp.rect.width, sp.rect.height)
+    bbox, trimmed = content_bbox(sp)
+    if verbose and trimmed:
+        print("  检测到内容边界 %s（原页 %s），裁掉外围空白" %
+              (tuple(round(v) for v in bbox), tuple(round(v) for v in sp.rect)), flush=True)
+    cols, rows, aw, ah, n = split_spec(bbox.width, bbox.height)
     if verbose:
         print("  %s -> %d 张 A4 (%dx%d, %.0fx%.0f)" %
               (label, n, cols, rows, aw, ah), flush=True)
     out = fitz.open()
-    sw, sh = sp.rect.width, sp.rect.height
+    bw, bh = bbox.width, bbox.height
     idx = 0
     for row in range(rows):
         for col in range(cols):
-            clip = fitz.Rect(col*sw/cols, row*sh/rows,
-                             (col+1)*sw/cols, (row+1)*sh/rows)
+            clip = fitz.Rect(bbox.x0 + col*bw/cols, bbox.y0 + row*bh/rows,
+                             bbox.x0 + (col+1)*bw/cols, bbox.y0 + (row+1)*bh/rows)
             page = out.new_page(width=aw, height=ah)
             page.show_pdf_page(fitz.Rect(0, 0, aw, ah), src, 0,
                                clip=clip, keep_proportion=True)

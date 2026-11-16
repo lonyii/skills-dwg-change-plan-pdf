@@ -88,7 +88,8 @@ python scripts/change_plan_pdf.py --pairs pairs.json --out-dir "输出目录"
 python scripts/split_to_a4.py "设计方案.pdf" "变更方案.pdf" --out "工程编号-工程名称-变更方案附图.pdf"
 ```
 
-脚本按面积比自动选 A4 网格（A1→4×2=8 张），1:1 矢量平铺，逐张在右上角加"设计方案N"/"变更方案N"编号（fitz 内置 `china-s` 中文字体，无需外部字体文件），设计在前变更在后合并输出。
+脚本按**导出 PDF 的实际页面尺寸**自动判定（面积比+宽高比匹配，A1→8、A2→4、A3→2、A4→1，也支持 A0/自定义大幅面），1:1 矢量平铺不缩放，逐张在右上角加"设计方案N"/"变更方案N"编号（fitz 内置 `china-s` 中文字体，无需外部字体文件），设计在前变更在后合并输出。
+内容只占页面一角时会检测内容边界并裁掉外围空白（面积占比 < 0.55 才裁，保护整页分幅）。完整判定标准见 `references/a4_split_standard.md`（基于 18 张真实图纸样本实测）。
 
 ## 资源
 
@@ -96,3 +97,4 @@ python scripts/split_to_a4.py "设计方案.pdf" "变更方案.pdf" --out "工�
 - `scripts/split_to_a4.py`：A4 分幅切割 + 逐张编号标注 + 合并。
 - `references/technical_notes.md`：浩辰 COM 打印接口、介质映射、字体诊断与排错参考。
 - `references/naming_patterns.md`：本地图纸命名与编号规律（样本扫描），配对策略与常见坑，配对不确定时加载。
+- `references/a4_split_standard.md`：A4 分幅尺寸判定标准与清晰度保障（18 张样本实测），分幅逻辑不确定时加载。
