@@ -6,7 +6,7 @@ agent_created: true
 
 # 变更方案附图 PDF（DWG 平面图出图）
 
-**正式版 v1.0.0** — 核心流程（黑白矢量导出、SHX 字体修复、索引排版裁切、加字、单项工程合并、A4 自动分幅、尺寸判定）已实现并经多样本验证。
+**正式版 v1.1.0** — 核心流程（黑白矢量导出、SHX 字体修复、索引排版裁切、加字、单项工程合并、A4 自动分幅、尺寸判定）已实现并经多样本验证；v1.1.0 新增「整套图纸拼版布局」的定位与手工裁切流程（`inspect_frames.py` + `--sj-clip/--jg-clip` + `--a4-single`）。
 
 ## 概述
 
@@ -57,6 +57,37 @@ python scripts/change_plan_pdf.py --pairs pairs.json --out-dir "输出目录"
 | `--sj-text` / `--jg-text` | 两页文字内容 |
 | `--preview` | 同时输出低分辨率预览 PNG |
 | `--verbose` | 打印详细过程 |
+| `--sj-clip` / `--jg-clip` | 手工指定平面图裁切框 `x0,y0,x1,y1`（raw PDF 坐标，单位 pt）；拼版布局用，优先级高于自动检测。pairs.json 里可逐对写 `sj_clip`/`jg_clip` |
+| `--a4-single` | 拼版布局专用：把裁出的小平面图整幅放单张 A4，直接输出成品，不再走 `split_to_a4.py` 的 1:1 切 8 张 A4（那样会把小图切碎） |
+
+## 整套图纸拼版布局（重要，v1.1.0）
+
+部分设计院的施工图/竣工图 DWG 把**整本图纸拼在一个布局里**：封面、图纸目录、材料表、设计说明、带"请勿打印"大 X 的索引页、A2 小图框（平面图+系统图+材料表）全挤在一张 A1 上。此类图纸的自动套框会裁到封面或"请勿打印"索引页，产出错误成品。
+
+**识别**：脚本在导出后会用 `looks_composite()` 检测——候选大框 ≥3 个，或存在贯穿整页的长斜线（大 X）。命中时打印 ⚠ 警告。
+
+**标准处理流程**（以 NC26E789 滁槎老汤店厨房燃气工程为例，已回归验证）：
+
+```bash
+# 1) 先按默认参数导出一次，raw PDF 落在 <out-dir>/_work_<编号>/sj_raw.pdf、jg_raw.pdf
+python scripts/change_plan_pdf.py "施工图.dwg" "竣工图.dwg" --out-dir "输出目录" --preview
+#    （此时会打印拼版布局警告，成品先不管）
+
+# 2) 列出候选图框，生成每张框的放大预览与整页编号图
+python scripts/inspect_frames.py "输出目录/_work_<编号>/sj_raw.pdf" "输出目录/_work_<编号>/jg_raw.pdf" --out-dir "定位预览目录"
+#    看 定位预览目录/frame_N_<raw>.png 找到平面图所在框；
+#    若该框内还并排多张图（如目录+平面图），用 pymupdf 按像素再细裁到平面图本身
+
+# 3) 用确定的坐标重跑，一步到位出 A4 成品（两页：设计方案 / 变更方案）
+python scripts/change_plan_pdf.py "施工图.dwg" "竣工图.dwg" --out-dir "输出目录" \
+  --a4-single --sj-clip "1500,48,1714,430" --jg-clip "957,1312,1045,1455" \
+  --sj-text "设计方案：XX工程（施工图·室内外低压燃气管道平面图 1:100）" \
+  --jg-text "变更方案：XX工程（竣工图·室内外低压燃气管道平面图 1:100）"
+```
+
+NC26E789 实测坐标（A1 页面 2384×1684 pt）：施工图平面图在右上框右半 `(1500,48,1714,430)`，竣工图平面图在下方 A2 小框左半 `(957,1312,1045,1455)`。换工程须重新用 `inspect_frames.py` 定位，不要直接套用这组坐标。
+
+普通图纸（单张平面图或标准两框索引排版）**不需要**这些参数，保持默认即可。
 
 ## 输出口径（强制）
 
@@ -93,7 +124,8 @@ python scripts/split_to_a4.py "设计方案.pdf" "变更方案.pdf" --out "工�
 
 ## 资源
 
-- `scripts/change_plan_pdf.py`：主程序，封装导出/字体修复/裁切/加字/合并全流程，可直接 CLI 调用。
+- `scripts/change_plan_pdf.py`：主程序，封装导出/字体修复/裁切/加字/合并全流程，可直接 CLI 调用。v1.1.0 新增 `--sj-clip`/`--jg-clip`/`--a4-single`。
+- `scripts/inspect_frames.py`：v1.1.0 新增。列出 raw PDF 中的候选图框坐标、生成编号预览图，用于拼版布局手工定位平面图。
 - `scripts/split_to_a4.py`：A4 分幅切割 + 逐张编号标注 + 合并。
 - `references/technical_notes.md`：浩辰 COM 打印接口、介质映射、字体诊断与排错参考。
 - `references/naming_patterns.md`：本地图纸命名与编号规律（样本扫描），配对策略与常见坑，配对不确定时加载。

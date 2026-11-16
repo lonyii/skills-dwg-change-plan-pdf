@@ -27,7 +27,7 @@ pairs.json 格式（多对）：
 """
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
 import json
@@ -191,11 +191,56 @@ def export_layout(doc, out_pdf: str, paper: str = "A1", plot_type: int = 1,
     return out_pdf
 
 
+def parse_clip(value) -> Optional[Tuple[float, float, float, float]]:
+    """解析 --sj-clip/--jg-clip：x0,y0,x1,y1（导出的 raw PDF 坐标，单位 pt）。"""
+    if not value:
+        return None
+    parts = [p.strip() for p in str(value).replace("，", ",").split(",")]
+    if len(parts) != 4:
+        raise ValueError("clip 需为 4 个逗号分隔的数字 x0,y0,x1,y1，收到: %s" % value)
+    try:
+        nums = tuple(float(p) for p in parts)
+    except ValueError:
+        raise ValueError("clip 含非数字: %s" % value)
+    if nums[2] <= nums[0] or nums[3] <= nums[1]:
+        raise ValueError("clip 坐标无效（x1<=x0 或 y1<=y0）: %s" % value)
+    return nums
+
+
+def looks_composite(pdf_path: str) -> bool:
+    """检测「整套图纸拼版」布局：>=3 个大矢量框，或存在贯穿整页的长斜线（"请勿打印"大 X）。
+
+    此类布局下 is_index_layout() 的两框判据会失效/误裁，必须用 inspect_frames.py
+    列出候选框后用 --sj-clip/--jg-clip 指定平面图坐标。
+    """
+    import fitz
+    d = fitz.open(pdf_path)
+    p = d[0]
+    pw, ph = p.rect.width, p.rect.height
+    frames = []
+    diag = 0
+    for g in p.get_drawings():
+        r = g["rect"]
+        if pw*0.12 < r.width < pw*0.98 and ph*0.12 < r.height < ph*0.98 and r.x0 > 10 and r.y0 > 10:
+            t = (round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+            if not any(all(abs(a-b) < 4 for a, b in zip(t, u)) for u in frames):
+                frames.append(t)
+        for it in g["items"]:
+            if it[0] == "l":
+                a, b = it[1], it[2]
+                if abs(b.x-a.x) > pw*0.15 and abs(b.y-a.y) > ph*0.15:
+                    diag += 1
+    d.close()
+    return len(frames) >= 3 or diag >= 2
+
+
 def is_index_layout(pdf_path: str, paper: str) -> Optional[Tuple[float, float, float, float]]:
     """检测是否为"索引排版"（一张纸上有平面图框+材料表框）。
 
     返回上方平面图框 rect；普通整张平面图返回 None。
     判据：找到两个宽度、高度接近的大矩形，且纵向排列。
+    ⚠ 整套图纸拼版（多图框/含"请勿打印"大 X）时此判据不可靠，
+       由 looks_composite() 识别并提示手动指定 clip。
     """
     import fitz
     d = fitz.open(pdf_path)
@@ -267,6 +312,35 @@ def stamp_text(pdf_path: str, text: str, x: int, y: int, size: int,
     return dst
 
 
+A4_PORTRAIT = (595.276, 841.890)  # A4 竖向 pt
+
+
+def stamp_a4_single(src_pdf: str, title: str, label: str, out_pdf: str,
+                    clip=None, font: str = FONT_PATH):
+    """把一张平面图整幅放进一张 A4 竖向页，顶部写标题、右上写编号。
+
+    用于拼版布局里裁出的小平面图：标准 split_to_a4.py 按 1:1 把 A1 切 8 张 A4，
+    对小图框会把一张平面图切碎；本函数改为整幅缩放铺满单张 A4。
+    clip 不为空时直接从 raw PDF 按该框裁切（推荐，避免先铺满 A1 再缩小的留白）；
+    clip 为空时对 src_pdf 整页铺入。
+    """
+    import fitz
+    src = fitz.open(src_pdf)
+    out = fitz.open()
+    pw, ph = A4_PORTRAIT
+    page = out.new_page(width=pw, height=ph)
+    page.show_pdf_page(fitz.Rect(40, 80, pw-40, ph-40), src, 0,
+                       clip=fitz.Rect(*clip) if clip else fitz.Rect(src[0].rect),
+                       keep_proportion=True)
+    page.insert_font(fontname="SH", fontfile=font)
+    page.insert_text((28, 34), title, fontname="SH", fontsize=13, color=(0, 0, 0))
+    page.insert_text((pw-110, 62), label, fontname="SH", fontsize=12, color=(0, 0, 0))
+    out.save(out_pdf, garbage=3, deflate=True)
+    out.close()
+    src.close()
+    return out_pdf
+
+
 def merge_pdfs(paths, out_pdf: str):
     """按顺序合并 PDF。"""
     import fitz
@@ -300,11 +374,14 @@ def project_code(name: str) -> Optional[str]:
 
 def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text: str,
                  text_pos: str, preview: bool, code: Optional[str] = None,
-                 sj_layout: Optional[str] = None, verbose=False) -> Tuple[str, str]:
+                 sj_layout: Optional[str] = None, verbose=False,
+                 sj_clip=None, jg_clip=None, a4_single=False) -> Tuple[str, str]:
     """处理一对施工图/竣工图，返回 (设计页PDF, 变更页PDF)。
 
     code 为竣工图工程编号：一份施工图 DWG 含多个工程图纸时，用它定位对应布局。
     sj_layout 可显式指定施工图要导出的布局名。
+    sj_clip/jg_clip 为手工指定的平面图裁切框 (x0,y0,x1,y1, raw PDF 坐标)，
+    用于「整套图纸拼版」布局（自动检测会裁错封面/索引页）。
     """
     import fitz
     pythoncom, app = _com()
@@ -351,25 +428,53 @@ def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text:
     sj_final = os.path.join(work, "sj_final.pdf")
     jg_final = os.path.join(work, "jg_final.pdf")
 
-    # 施工图：整张导出（通常不是索引排版）
-    clip = is_index_layout(sj_raw, paper)
+    # 施工图：优先手工 clip；否则整张导出（通常不是索引排版）
     sj_src = sj_raw
-    if clip:
-        crop_plan_frame(sj_raw, os.path.join(work, "sj_crop.pdf"), clip, paper, verbose)
-        sj_src = os.path.join(work, "sj_crop.pdf")
-    x, y, size = default_text_pos("sj", paper)
-    stamp_text(sj_src, sj_text, x, y, size, sj_final)
-
-    # 竣工图：若是索引排版，裁平面图框
-    clip = is_index_layout(jg_raw, paper)
-    jg_src = jg_raw
-    if clip:
+    sj_effective_clip = sj_clip
+    if sj_clip:
         if verbose:
-            print("  检测到索引排版，裁出上方平面图框", flush=True)
-        crop_plan_frame(jg_raw, os.path.join(work, "jg_crop.pdf"), clip, paper, verbose)
-        jg_src = os.path.join(work, "jg_crop.pdf")
-    x, y, size = default_text_pos("jg", paper)
-    stamp_text(jg_src, jg_text, x, y, size, jg_final)
+            print("  施工图使用手工 clip: %s" % (sj_clip,), flush=True)
+        if not a4_single:
+            crop_plan_frame(sj_raw, os.path.join(work, "sj_crop.pdf"), sj_clip, paper, verbose)
+            sj_src = os.path.join(work, "sj_crop.pdf")
+    elif looks_composite(sj_raw):
+        print("  ⚠ 施工图为整套图纸拼版布局，自动出图可能裁到封面/目录："
+              "请运行 inspect_frames.py 后用 --sj-clip 指定平面图坐标", flush=True)
+    else:
+        sj_effective_clip = is_index_layout(sj_raw, paper)
+        if sj_effective_clip:
+            crop_plan_frame(sj_raw, os.path.join(work, "sj_crop.pdf"), sj_effective_clip, paper, verbose)
+            sj_src = os.path.join(work, "sj_crop.pdf")
+    if a4_single:
+        stamp_a4_single(sj_raw, sj_text, "设计方案1", sj_final, clip=sj_effective_clip)
+    else:
+        x, y, size = default_text_pos("sj", paper)
+        stamp_text(sj_src, sj_text, x, y, size, sj_final)
+
+    # 竣工图：优先手工 clip；否则若为索引排版则裁平面图框
+    jg_src = jg_raw
+    jg_effective_clip = jg_clip
+    if jg_clip:
+        if verbose:
+            print("  竣工图使用手工 clip: %s" % (jg_clip,), flush=True)
+        if not a4_single:
+            crop_plan_frame(jg_raw, os.path.join(work, "jg_crop.pdf"), jg_clip, paper, verbose)
+            jg_src = os.path.join(work, "jg_crop.pdf")
+    elif looks_composite(jg_raw):
+        print("  ⚠ 竣工图为整套图纸拼版布局，自动出图可能裁到索引/说明页："
+              "请运行 inspect_frames.py 后用 --jg-clip 指定平面图坐标", flush=True)
+    else:
+        jg_effective_clip = is_index_layout(jg_raw, paper)
+        if jg_effective_clip:
+            if verbose:
+                print("  检测到索引排版，裁出上方平面图框", flush=True)
+            crop_plan_frame(jg_raw, os.path.join(work, "jg_crop.pdf"), jg_effective_clip, paper, verbose)
+            jg_src = os.path.join(work, "jg_crop.pdf")
+    if a4_single:
+        stamp_a4_single(jg_raw, jg_text, "变更方案1", jg_final, clip=jg_effective_clip)
+    else:
+        x, y, size = default_text_pos("jg", paper)
+        stamp_text(jg_src, jg_text, x, y, size, jg_final)
 
     if preview:
         for tag, path in [("设计", sj_final), ("变更", jg_final)]:
@@ -391,12 +496,17 @@ def main():
     ap.add_argument("--jg-text", default="变更方案：", help="竣工图页面文字")
     ap.add_argument("--text-pos", default="right-bottom", help="文字位置（预留）")
     ap.add_argument("--preview", action="store_true", help="生成低分辨率预览 PNG")
+    ap.add_argument("--sj-clip", help="施工图平面图的 raw PDF 裁切框 x0,y0,x1,y1（拼版布局用）")
+    ap.add_argument("--jg-clip", help="竣工图平面图的 raw PDF 裁切框 x0,y0,x1,y1（拼版布局用）")
+    ap.add_argument("--a4-single", action="store_true",
+                    help="拼版布局专用：把裁出的小平面图整幅放单张 A4，直接输出成品，不再走 split_to_a4 1:1 切分")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     import fitz  # noqa
 
     os.makedirs(args.out_dir, exist_ok=True)
+    sj_clip, jg_clip = parse_clip(args.sj_clip), parse_clip(args.jg_clip)
 
     # 组装 pairs
     pairs = []
@@ -411,9 +521,10 @@ def main():
             if not sj or not os.path.exists(sj) or not os.path.exists(jg):
                 print("跳过（找不到文件）: %s" % it, flush=True)
                 continue
-            pairs.append((sj, jg, it.get("sj_layout")))
+            pairs.append((sj, jg, it.get("sj_layout"),
+                          parse_clip(it.get("sj_clip")), parse_clip(it.get("jg_clip"))))
     elif len(args.dwg) == 2:
-        pairs.append((args.dwg[0], args.dwg[1], None))
+        pairs.append((args.dwg[0], args.dwg[1], None, sj_clip, jg_clip))
     else:
         ap.error("需提供两个 DWG（施工图、竣工图），或使用 --pairs")
 
@@ -424,6 +535,8 @@ def main():
     for idx, item in enumerate(pairs, 1):
         sj, jg = item[0], item[1]
         sj_layout = item[2] if len(item) > 2 else None
+        pair_sj_clip = item[3] if len(item) > 3 else None
+        pair_jg_clip = item[4] if len(item) > 4 else None
         code = project_code(jg) or ("工程%02d" % idx)
         base = os.path.splitext(os.path.basename(jg))[0]
         # 名称取竣工图文件名去掉编号前缀部分
@@ -438,9 +551,13 @@ def main():
         sj_final, jg_final = process_pair(
             sj, jg, work, args.paper, args.sj_text, args.jg_text,
             args.text_pos, args.preview, code=code, sj_layout=sj_layout,
-            verbose=args.verbose)
+            verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
+            a4_single=args.a4_single)
         merged = merge_pdfs([sj_final, jg_final], os.path.join(args.out_dir, out_name))
-        print("完成: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
+        if args.a4_single:
+            print("完成（A4 单幅）: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
+        else:
+            print("完成: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
 
     return 0
 
