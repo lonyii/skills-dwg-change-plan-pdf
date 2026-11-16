@@ -75,8 +75,8 @@ python scripts/change_plan_pdf.py --pairs pairs.json --out-dir "输出目录"
 - **纸张 A1 在 CAD 里不叫 "A1"**：`DWG To PDF.pc3` 介质名是 User 编号，A1 横向 = `User65737` 且 `PlotRotation=0`（用 1 会变竖版）。脚本已内置映射。
 - **`PlotType=1`（范围）是浩辰唯一可靠值**；`PlotType=4`（窗口）会导出空白 888B 文件。
 - **`PlotToFile` 是异步的**，调用后必须等待 8 秒再读取文件。
-- **竣工图文字糊成黑块 = 缺 SHX 大字体**（hztxt.shx/gbcbig.shx/nchz.shx 等）。导出前须把所有文字样式替换为系统宋体：
-  `SetFont("宋体",False,False,134,49)` + `fontFile="simsun.ttc"` + `BigFontFile=""`，仅在内存修改，`Close(False)` 不保存 DWG。**施工图字体正常，不要替换**。
+- **竣工图文字糊成黑块 = SHX 大字体无法被浩辰 PDF 驱动渲染**（hztxt.shx/gbcbig.shx/stedi.shx 等）。实测即使本机装有这些字体，保持原字体导出仍是黑块，**必须替换为系统宋体**：
+  `SetFont("宋体",False,False,134,49)` + `fontFile="simsun.ttc"` + `BigFontFile=""`，仅在内存修改，`Close(False)` 不保存 DWG。**施工图字体正常，不要替换**。`assets/fonts/` 收录了常见 SHX 字体备查，但当前环境不靠它们解决黑块。
 - **竣工图布局常是"索引排版"**（平面图框 + 材料表框上下排列）。脚本自动检测，裁出上方平面图框铺满 A1，去掉材料表。施工图直接整张导出。
 - 文字位置按纸张比例从 A3 基准 (916,686)/(908,703) 自动换算；需要精确指定时改 `default_text_pos()`。
 
@@ -98,3 +98,4 @@ python scripts/split_to_a4.py "设计方案.pdf" "变更方案.pdf" --out "工�
 - `references/technical_notes.md`：浩辰 COM 打印接口、介质映射、字体诊断与排错参考。
 - `references/naming_patterns.md`：本地图纸命名与编号规律（样本扫描），配对策略与常见坑，配对不确定时加载。
 - `references/a4_split_standard.md`：A4 分幅尺寸判定标准与清晰度保障（18 张样本实测），分幅逻辑不确定时加载。
+- `assets/fonts/`：hztxt.shx / gbcbig.shx / stedi.shx 备查资源（当前环境导出仍需宋体替换，详见 technical_notes.md）。

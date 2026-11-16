@@ -62,7 +62,10 @@ pairs.json 可写：`[{"jg": "竣工图NC25E096-xxx.dwg", "sj_layout": "总平�
 
 - `SKILL.md` — 技能说明与触发条件
 - `scripts/change_plan_pdf.py` — 主程序（CLI）
+- `scripts/split_to_a4.py` — A4 分幅切割
 - `references/technical_notes.md` — COM 接口、纸张介质、字体诊断等排错参考
+- `references/naming_patterns.md`、`references/a4_split_standard.md` — 样本实测规律与判定标准
+- `assets/fonts/` — hztxt.shx / gbcbig.shx / stedi.shx 备查（实测浩辰 PDF 驱动仍无法渲染 SHX，出图一律走宋体替换，见技术文档）
 
 ## License
 
