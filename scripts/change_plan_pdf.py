@@ -27,7 +27,7 @@ pairs.json 格式（多对）：
 """
 from __future__ import annotations
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 import argparse
 import json
@@ -255,6 +255,78 @@ def detect_plan_frame(pdf_path: str, verbose=False, min_rects=1):
                   (tuple(round(v) for v in c[:4]), c[4], c[5]), flush=True)
         print("  → 选中: %s" % (tuple(round(v) for v in best[:4]),), flush=True)
     return (best[0], best[1], best[2], best[3])
+
+
+def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
+    """在高分辨率打印的 PDF 中，用「平面图标题的双下划线」定位平面图区域。
+
+    竣工图平面图的标题（如"室内外低压燃气管道平面图1:100"）下方有两条间距
+    3~10pt、长度 50~300pt、左右端对齐的水平线，这是平面图标题的独特标志
+    （材料表/设计说明页没有）。找到后按经验比例向上取建筑平面图、向下取图例，
+    返回竖版平面图裁切框 (x0,y0,x1,y1)。找不到返回 None。
+    """
+    import fitz
+    d = fitz.open(pdf_path)
+    p = d[0]
+    if frame is None:
+        frame = p.rect
+    fr = fitz.Rect(*frame) if not isinstance(frame, fitz.Rect) else frame
+    hs = []
+    for g in p.get_drawings():
+        r = g["rect"]
+        if r.height < 3 and 50 < r.width < 300 and fr.contains(r):
+            hs.append((r.x0, r.y0, r.x1))
+    hs.sort(key=lambda h: (h[1], h[0]))
+    pairs = []
+    for i, a in enumerate(hs):
+        for b in hs[i+1:]:
+            gap = b[1] - a[1]
+            if gap > 12:
+                break
+            if abs(a[0]-b[0]) < 6 and abs(a[2]-b[2]) < 6 and 3 < gap < 10:
+                pairs.append((a, b))
+    d.close()
+    if not pairs:
+        # 退化：有些图的标题下划线是两条重合线(gap=0)，或只有一条长线
+        # 取框左半内、长度 40~300 的水平线里最靠下的那条作标题锚点
+        # 回退: 取框左半内、长度 40~200 的水平线中，位于框上半部的最靠下一条
+        left_lines = [h for h in hs if h[0] < fr.x0 + fr.width*0.62
+                      and 40 < h[2]-h[0] < 200 and h[1] < fr.y0 + fr.height*0.55]
+        if not left_lines:
+            return None
+        left_lines.sort(key=lambda h: -h[1])
+        a = left_lines[0]
+        b = a
+    else:
+        # 选最靠下、且左右端在框左半的一对（平面图在A2框左侧）
+        pairs.sort(key=lambda p: (p[0][0] > fr.x0 + fr.width*0.6, -p[0][1]))
+        a, b = pairs[0]
+    if verbose:
+        print("  标题双下划线: x=%.0f..%.0f y=%.0f" % (a[0], a[2], a[1]), flush=True)
+    # 用标题上方的线段端点找建筑轮廓bbox（比固定比例更贴合不同图幅）
+    ux0, ux1, uy = a[0], a[2], a[1]
+    cx = (ux0 + ux1) / 2
+    uw = max(ux1 - ux0, 40)
+    d2 = fitz.open(pdf_path)
+    pg = d2[0]
+    top = fitz.Rect(cx - uw*1.8, max(fr.y0, uy-340), cx + uw*1.8, uy + 5)
+    xs, ys = [], []
+    for g in pg.get_drawings():
+        for it in g["items"]:
+            if it[0] == "l":
+                p1, p2 = it[1], it[2]
+                if top.contains(p1) and top.contains(p2):
+                    xs += [p1.x, p2.x]; ys += [p1.y, p2.y]
+    d2.close()
+    if xs:
+        # 建筑轮廓左界不应比标题左界靠左太多（避免把图纸目录竖列表格带进来）
+        bx0 = max(min(xs), ux0 - uw*0.8)
+        bx1 = min(max(xs), ux1 + uw*1.5)
+        by0 = min(ys)
+    else:
+        bx0, bx1, by0 = ux0 - uw, ux1 + uw, uy - 200
+    # 图例在标题下方约 0.5~1 倍下划线宽
+    return (bx0 - 10, by0 - 10, bx1 + 10, uy + uw*0.9)
 
 
 def parse_clip(value) -> Optional[Tuple[float, float, float, float]]:
@@ -554,7 +626,7 @@ def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text:
 def process_frame_print(sj: str, jg: str, work: str, paper: str,
                         sj_text: str, jg_text: str, scale: float = 4,
                         origin=None, preview=False, verbose=False,
-                        sj_clip=None, jg_clip=None):
+                        sj_clip=None, jg_clip=None, plan_only=False):
     """【高分辨率图框打印模式】放大打印 → 定位目标图框 → 裁切到 A4。
 
     原理：SHX 大字体糊成黑块的根因是打印比例太小、分辨率不够（目标图框在
@@ -613,7 +685,12 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
                               verbose=verbose)
             finally:
                 d.Close(False)
-            clip = manual_clip or detect_plan_frame(raw, verbose, min_rects=1)
+            frame = detect_plan_frame(raw, verbose, min_rects=1)
+            if plan_only and frame and not manual_clip:
+                sub = detect_plan_title_underline(raw, frame, verbose)
+                clip = sub or frame
+            else:
+                clip = manual_clip or frame
             tried.append((trial_scale, clip))
             if clip:
                 chosen = (trial_scale, clip)
@@ -656,6 +733,9 @@ def main():
                          "不用宋体替换。仅打印目标图框，不把整套拼版塞进一页")
     ap.add_argument("--scale", type=float, default=4.0, help="--frame-print 的放大比例，默认 4")
     ap.add_argument("--plot-origin", help="--frame-print 的打印原点 x_mm,y_mm（可选，默认不设）")
+    ap.add_argument("--plan-only", action="store_true",
+                    help="只输出平面图本身(建筑+管道+标题+图例)，不含材料表/说明/系统图；"
+                         "通过平面图标题双下划线自动定位子区域")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -714,7 +794,8 @@ def main():
             sj_final, jg_final = process_frame_print(
                 sj, jg, work, args.paper, args.sj_text, args.jg_text,
                 scale=args.scale, origin=origin, preview=args.preview,
-                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip)
+                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
+                plan_only=args.plan_only)
         else:
             sj_final, jg_final = process_pair(
                 sj, jg, work, args.paper, args.sj_text, args.jg_text,
