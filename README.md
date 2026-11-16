@@ -1,4 +1,6 @@
-# skills-dwg-change-plan-pdf
+# skills-dwg-change-plan-pdf（测试版）
+
+> ⚠️ **测试版 v0.1.0-test**：核心流程已实现并部分验证（A1 黑白导出、字体修复、索引排版裁切、加字、合并）；完整端到端回归因竣工图所在的映射网络盘临时掉线尚未跑完，恢复后需复测。
 
 DWG 施工图 + 竣工图 → **变更方案附图 PDF** 的 WorkBuddy 技能。
 
@@ -34,7 +36,16 @@ python scripts/change_plan_pdf.py "施工图.dwg" "竣工图.dwg" --out-dir "输
 
 ```bash
 python scripts/change_plan_pdf.py --pairs pairs.json --out-dir "输出目录"
+# 或只给竣工图，按编号自动在施工图目录配对：
+python scripts/change_plan_pdf.py --pairs pairs.json --sj-dir "施工图目录" --out-dir "输出目录"
 ```
+
+一份施工图 DWG 含多个工程图纸时，以竣工图工程编号为准定位对应施工图/布局：
+- 施工图文件名含相同编号 → 自动匹配；
+- 布局名含该编号 → 自动选该布局；
+- 都不含 → 在 pairs.json 里为该条目指定 `"sj_layout": "布局名"`。
+
+pairs.json 可写：`[{"jg": "竣工图NC25E096-xxx.dwg", "sj_layout": "总平面图2"}]`
 
 也可直接在 WorkBuddy 对话中提供施工图与竣工图 DWG，说"出变更方案附图"，技能会自动触发。
 

@@ -65,9 +65,21 @@ def _com():
     return pythoncom, app
 
 
-def find_layout(doc, prefer: str = "总平面图"):
-    """返回布局对象：优先按名称含 prefer 找，否则取模型空间之外的第一个布局。"""
+def find_layout(doc, prefer: str = "总平面图", code: Optional[str] = None):
+    """返回布局对象。
+
+    定位优先级：
+      1. 指定 code 时，布局名含该工程编号的（用于一份 DWG 多工程图纸）
+      2. 布局名含 prefer（如"总平面图"）
+      3. 模型空间之外的第一个布局
+      4. 模型空间
+    """
     n = doc.Layouts.Count
+    if code:
+        for i in range(n):
+            lay = doc.Layouts.Item(i)
+            if code.lower() in str(lay.Name).lower():
+                return lay
     for i in range(n):
         lay = doc.Layouts.Item(i)
         if prefer in str(lay.Name):
@@ -77,6 +89,37 @@ def find_layout(doc, prefer: str = "总平面图"):
         if not lay.ModelType:
             return lay
     return doc.Layouts.Item(0)
+
+
+def match_sj_by_code(jg_path: str, sj_dir: str, verbose=False) -> Optional[str]:
+    """以竣工图工程编号为准，在施工图目录中找到对应的施工图文件。
+
+    匹配规则（按优先级）：
+      1. 施工图文件名含与竣工图相同的工程编号（如 NC25E096）
+      2. 施工图文件名含竣工图的工程名称关键字
+    编号一律取竣工图，不用施工图自己的命名。
+    """
+    code = project_code(jg_path)
+    if not code or not sj_dir or not os.path.isdir(sj_dir):
+        return None
+    jg_base = os.path.splitext(os.path.basename(jg_path))[0]
+    name_key = re.sub(r"^[A-Z]{2}\d{2}[A-Z]?\d{3}[-_ ]*", "", jg_base, flags=re.I)
+    name_key = re.split(r"[（(]", name_key)[0][:12]  # 取工程名前段作为兜底关键字
+    files = [f for f in os.listdir(sj_dir) if f.lower().endswith(".dwg")]
+    # 1) 编号精确匹配
+    for f in files:
+        if code.lower() in f.lower():
+            if verbose:
+                print("  施工图按编号匹配: %s (编号 %s)" % (f, code), flush=True)
+            return os.path.join(sj_dir, f)
+    # 2) 工程名关键字匹配
+    if name_key:
+        for f in files:
+            if name_key in f:
+                if verbose:
+                    print("  施工图按工程名匹配: %s" % f, flush=True)
+                return os.path.join(sj_dir, f)
+    return None
 
 
 def fix_fonts(doc, verbose=False):
@@ -107,11 +150,16 @@ def fix_fonts(doc, verbose=False):
 
 
 def export_layout(doc, out_pdf: str, paper: str = "A1", plot_type: int = 1,
-                  fix_shx: bool = False, verbose=False) -> str:
-    """把指定布局黑白导出为 PDF。plot_type=1(范围)是浩辰唯一可靠值，4(窗口)会导出空白。"""
+                  fix_shx: bool = False, code: Optional[str] = None,
+                  prefer: str = "总平面图", verbose=False) -> str:
+    """把指定布局黑白导出为 PDF。plot_type=1(范围)是浩辰唯一可靠值，4(窗口)会导出空白。
+
+    code 不为空时，优先选布局名含该工程编号的布局（一份 DWG 多工程图纸场景）。
+    prefer 可覆盖默认布局偏好（用于 pairs.json 指定 sj_layout）。
+    """
     import fitz
     media, rotation, _ = PAPER_MEDIA[paper]
-    lay = find_layout(doc)
+    lay = find_layout(doc, prefer=prefer, code=code)
     if verbose:
         print("  布局=%s 纸张=%s(%s) 旋转=%d" % (lay.Name, paper, media, rotation), flush=True)
     lay.ConfigName = PDF_DRIVER
@@ -231,14 +279,31 @@ def merge_pdfs(paths, out_pdf: str):
 
 
 def project_code(name: str) -> Optional[str]:
-    """从竣工图文件名提取单项工程编号（前缀大写字母+数字，如 NC25E096）。"""
-    m = re.search(r"([A-Z]{2}\d{2}[A-Z]?\d{3})", os.path.basename(name), re.I)
-    return m.group(1).upper() if m else None
+    """从竣工图文件名提取单项工程编号。
+
+    本地样本（556/562 命中）验证的格式：
+      NC25E096 / IC24A016 / ID25H023 / NC25F009  (2字母+2数字+1字母+3数字)
+      NC24EA15 / NC24EA86                          (2字母+2数字+1字母+3位，字母后跟2位也被接受)
+    用宽松正则：2字母 + 2数字 + 可选1字母 + 3~4位字母数字。
+    """
+    base = os.path.basename(name)
+    # 优先标准格式，兼容字母后跟 2~3 位
+    m = re.search(r"\b([A-Z]{2}\d{2}[A-Z]?[A-Z0-9]{2,4})\b", base, re.I)
+    if not m:
+        return None
+    code = m.group(1).upper()
+    # 排除明显的图号/合同号（含 DD/FN/BG 等项目内编号前缀）
+    return code
 
 
 def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text: str,
-                 text_pos: str, preview: bool, verbose=False) -> Tuple[str, str]:
-    """处理一对施工图/竣工图，返回 (设计页PDF, 变更页PDF)。"""
+                 text_pos: str, preview: bool, code: Optional[str] = None,
+                 sj_layout: Optional[str] = None, verbose=False) -> Tuple[str, str]:
+    """处理一对施工图/竣工图，返回 (设计页PDF, 变更页PDF)。
+
+    code 为竣工图工程编号：一份施工图 DWG 含多个工程图纸时，用它定位对应布局。
+    sj_layout 可显式指定施工图要导出的布局名。
+    """
     import fitz
     pythoncom, app = _com()
 
@@ -270,7 +335,8 @@ def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text:
         if verbose:
             print("[1/3] 导出施工图...", flush=True)
         d = open_doc(sj)
-        export_layout(d, sj_raw, paper=paper, fix_shx=False, verbose=verbose)
+        export_layout(d, sj_raw, paper=paper, fix_shx=False, code=code,
+                      prefer=sj_layout or "总平面图", verbose=verbose)
         d.Close(False)
         if verbose:
             print("[2/3] 导出竣工图（字体修复）...", flush=True)
@@ -337,17 +403,15 @@ def main():
             items = json.load(f)
         for it in items:
             sj, jg = it.get("sj"), it.get("jg")
+            # 以竣工图工程编号为准找对应施工图（一个施工图文件含多工程图纸时也适用）
             if not sj and args.sj_dir:
-                code = project_code(jg)
-                cands = [os.path.join(args.sj_dir, f) for f in os.listdir(args.sj_dir)
-                         if code and code.lower() in f.lower() and f.lower().endswith(".dwg")]
-                sj = cands[0] if cands else None
+                sj = match_sj_by_code(jg, args.sj_dir, args.verbose)
             if not sj or not os.path.exists(sj) or not os.path.exists(jg):
                 print("跳过（找不到文件）: %s" % it, flush=True)
                 continue
-            pairs.append((sj, jg))
+            pairs.append((sj, jg, it.get("sj_layout")))
     elif len(args.dwg) == 2:
-        pairs.append((args.dwg[0], args.dwg[1]))
+        pairs.append((args.dwg[0], args.dwg[1], None))
     else:
         ap.error("需提供两个 DWG（施工图、竣工图），或使用 --pairs")
 
@@ -355,7 +419,9 @@ def main():
         print("没有可处理的图纸对", flush=True)
         return 1
 
-    for idx, (sj, jg) in enumerate(pairs, 1):
+    for idx, item in enumerate(pairs, 1):
+        sj, jg = item[0], item[1]
+        sj_layout = item[2] if len(item) > 2 else None
         code = project_code(jg) or ("工程%02d" % idx)
         base = os.path.splitext(os.path.basename(jg))[0]
         # 名称取竣工图文件名去掉编号前缀部分
@@ -364,9 +430,13 @@ def main():
         work = os.path.join(args.out_dir, "_work_%s" % code)
         os.makedirs(work, exist_ok=True)
         print("\n=== %s ===" % out_name, flush=True)
+        if args.verbose:
+            print("  竣工图编号: %s | 施工图: %s" %
+                  (code, os.path.basename(sj)), flush=True)
         sj_final, jg_final = process_pair(
             sj, jg, work, args.paper, args.sj_text, args.jg_text,
-            args.text_pos, args.preview, args.verbose)
+            args.text_pos, args.preview, code=code, sj_layout=sj_layout,
+            verbose=args.verbose)
         merged = merge_pdfs([sj_final, jg_final], os.path.join(args.out_dir, out_name))
         print("完成: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
 
