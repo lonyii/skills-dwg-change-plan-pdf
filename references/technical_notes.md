@@ -220,3 +220,20 @@ page.insert_text((x, y), "设计方案：", fontname="SH", fontsize=26, color=(0
 **处理**：v1.3.2 起 `export_layout()` 检测布局原生介质为 A4 且目标非 A4 时打印明确警告，
 不再静默产生空白 PDF。这类图纸目前**不在支持范围**，需人工处理或后续单独开发。
 老 IC 系列竣工图（A1 拼版、带建筑轮廓平面图）不受影响，仍是本技能主用场景。
+
+## 5g. 系统图回退（--system-fallback，v1.4.0）
+
+用户口径："没有平面图可以导系统图"。对 5f 节的 A4 索引式施工图（华工设计院格式，
+无建筑平面图），`--system-fallback` 自动导出「系统图 1:100」：
+
+1. `is_a4_index_dwg()` 在改 ConfigName 前读布局原生介质，A4 即判定为索引式图纸。
+2. `process_a4_index()` 单 CAD 会话内：LISP（`dwg_tables.read_entities_lisp`）提取全部
+   图纸文字 → 找内容为「系统图」的标题坐标 → 图纸空间按标题坐标邻域 Wblock
+   （x: tx-28000..tx+20000，y: ty-28000..ty+5000，选中约 100 实体）→ A1 介质 1:1
+   打印 Wblock 临时 DWG（SHX 清晰）。
+3. 裁切用**矢量线段 bbox**（排除贴页面的边框线），比栅格投影更准——栅格按最大连续
+   暗列会把右侧说明/图例裁掉；矢量 bbox 含系统图+标题+图例。
+4. `stamp_a4_single()` 按 clip 放单张 A4（keep_proportion），完成后替换 sj_final/jg_final。
+
+NC26E085 实测：标题 (25427,-350555)，Wblock 106 实体，裁切框 (179,564)-(1599,1286)，
+成品系统图清晰、图例完整。

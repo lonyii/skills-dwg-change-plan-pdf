@@ -701,10 +701,154 @@ def process_pair(sj: str, jg: str, work: str, paper: str, sj_text: str, jg_text:
     return sj_final, jg_final
 
 
+def is_a4_index_dwg(doc) -> bool:
+    """判断 DWG 是否为 A4 索引式图纸（华工设计院格式）。
+
+    这类图纸布局原生介质是 A4（ISO_A4_... 或 A4），而非老 IC 图纸的 A1 拼版。
+    在修改 ConfigName 之前读取 CanonicalMediaName 才准确。
+    """
+    try:
+        lay = doc.Layouts.Item(1)
+        native = str(lay.CanonicalMediaName or "")
+        up = native.upper()
+        return up.startswith("A4") or "ISO_A4" in up
+    except Exception:
+        return False
+
+
+def process_a4_index(dwg: str, work: str, text: str, label: str,
+                      preview=False, verbose=False, app=None, doc=None):
+    """A4 索引式施工图（华工设计院格式，无建筑平面图）→ 导出「系统图 1:100」。
+
+    这类 DWG：布局是 A4 索引页（2x4 小缩略图），实际图框在图纸空间的大坐标区。
+    没有带建筑轮廓的平面图；用户口径：没有平面图就导系统图。
+
+    单会话流程：LISP 提文字找「系统图」标题 → Wblock 该图框区域 → A1 介质
+    1:1 打印 → 栅格投影裁出图框 → 放单张 A4。
+    """
+    import fitz
+    import numpy as np
+    import sys
+    own_com = app is None
+    if own_com:
+        pythoncom, app = _com()
+    raw = None
+    try:
+        d = doc if doc is not None else app.Documents.Open(os.path.abspath(dwg))
+        ents = None
+        skill_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        xls_scripts = os.path.join(os.path.dirname(skill_dir), "dwg-material-to-xls", "scripts")
+        if os.path.isdir(xls_scripts):
+            try:
+                sys.path.insert(0, xls_scripts)
+                import dwg_tables as dt
+                ents = dt.read_entities_lisp(dwg, app)
+            except Exception as e:
+                if verbose:
+                    print("  LISP 提取失败: %s" % str(e)[:60], flush=True)
+        sys_title = None
+        for e in (ents or []):
+            if str(e.get("t", "")).strip() == "系统图":
+                sys_title = (float(e["x"]), float(e["y"])); break
+        if not sys_title:
+            for e in (ents or []):
+                if "系统图" in str(e.get("t", "")):
+                    sys_title = (float(e["x"]), float(e["y"])); break
+        if not sys_title:
+            if verbose:
+                print("  ⚠ 未找到「系统图」标题", flush=True)
+            d.Close(False)
+            return None
+        tx, ty = sys_title
+        if verbose:
+            print("  系统图标题 (%.0f, %.0f)" % (tx, ty), flush=True)
+        ps = d.Layouts.Item(1).Block
+        X0, X1 = tx - 28000, tx + 20000
+        Y0, Y1 = ty - 28000, ty + 5000
+        sel = []
+        for i in range(ps.Count):
+            e = ps.Item(i)
+            if e.EntityName == "AcDbViewport":
+                continue
+            try:
+                mn, mx = e.GetBoundingBox()
+                cx, cy = (mn[0]+mx[0])/2, (mn[1]+mx[1])/2
+                if X0 <= cx <= X1 and Y0 <= cy <= Y1:
+                    sel.append(e)
+            except Exception:
+                pass
+        if verbose:
+            print("  Wblock 选中 %d 实体" % len(sel), flush=True)
+        if len(sel) < 20:
+            d.Close(False)
+            return None
+        ss = d.SelectionSets.Add("SYSREGION")
+        ss.AddItems(sel)
+        tmpdwg = os.path.join(work, "sysregion.dwg")
+        if os.path.exists(tmpdwg):
+            os.remove(tmpdwg)
+        d.Wblock(tmpdwg, ss)
+        d.Close(False)
+        # 打印 Wblock 临时 DWG（同一个 app）
+        d2 = app.Documents.Open(tmpdwg)
+        lay2 = d2.Layouts.Item(0)
+        lay2.ConfigName = PDF_DRIVER
+        lay2.RefreshPlotDeviceInfo()
+        lay2.CanonicalMediaName = PAPER_MEDIA["A1"][0]
+        lay2.PlotRotation = 0
+        lay2.StyleSheet = CTB
+        lay2.PlotType = 1
+        lay2.StandardScale = 0
+        lay2.CenterPlot = True
+        raw = os.path.join(work, "sys_raw.pdf")
+        if os.path.exists(raw):
+            os.remove(raw)
+        d2.Plot.SetLayoutsToPlot([lay2.Name])
+        d2.Plot.PlotToFile(raw)
+        time.sleep(8)
+        d2.Close(False)
+    finally:
+        if own_com:
+            pythoncom.CoUninitialize()
+    if not raw or not os.path.exists(raw) or os.path.getsize(raw) < 5000:
+        if verbose:
+            print("  ⚠ 系统图 Wblock 打印失败", flush=True)
+        return None
+    # 用矢量线段 bbox 找完整内容（排除 A1 页面边框线）——
+    # 栅格投影会因列断开误裁右侧，矢量 bbox 更准（含图例+系统图+标题）。
+    doc = fitz.open(raw)
+    pg = doc[0]
+    PW, PH = pg.rect.width, pg.rect.height
+    xs, ys = [], []
+    for g in pg.get_drawings():
+        for it in g["items"]:
+            if it[0] == "l":
+                a1, b1 = it[1], it[2]
+                # 页面边框线（贴边整线）跳过
+                if a1.x < 20 and b1.x < 20: continue
+                if a1.x > PW-20 and b1.x > PW-20: continue
+                if a1.y < 20 and b1.y < 20: continue
+                if a1.y > PH-20 and b1.y > PH-20: continue
+                xs += [a1.x, b1.x]; ys += [a1.y, b1.y]
+    doc.close()
+    if not xs:
+        return None
+    clip = (min(xs)-15, min(ys)-15, max(xs)+15, max(ys)+15)
+    out = os.path.join(work, "sys_final.pdf")
+    stamp_a4_single(raw, text, label, out, clip=clip)
+    if verbose:
+        print("  系统图裁切框 %s" % (tuple(round(v) for v in clip),), flush=True)
+    if preview:
+        fitz.open(out)[0].get_pixmap(matrix=fitz.Matrix(0.6, 0.6)).save(
+            out.replace(".pdf", "_预览.png"))
+    return out
+
+
 def process_frame_print(sj: str, jg: str, work: str, paper: str,
                         sj_text: str, jg_text: str, scale: float = 4,
                         origin=None, preview=False, verbose=False,
-                        sj_clip=None, jg_clip=None, plan_only=False):
+                        sj_clip=None, jg_clip=None, plan_only=False,
+                        system_fallback=False):
     """【高分辨率图框打印模式】放大打印 → 定位目标图框 → 裁切到 A4。
 
     原理：SHX 大字体糊成黑块的根因是打印比例太小、分辨率不够（目标图框在
@@ -748,6 +892,22 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
         manual_clip = sj_clip if tag == "sj" else jg_clip
         raw = os.path.join(work, "%s_scaled.pdf" % tag)
         out = os.path.join(work, "%s_final.pdf" % tag)
+        # A4 索引式图纸：无建筑平面图，直接走系统图导出（用户口径：没有平面图可导系统图）
+        if system_fallback:
+            d0 = open_doc(path)
+            try:
+                a4index = is_a4_index_dwg(d0)
+            except Exception:
+                a4index = False
+            if a4index:
+                print("  [%s] 检测到 A4 索引式图纸 → 导出系统图 1:100" % tag, flush=True)
+                sysout = process_a4_index(path, work, text, label, preview, verbose,
+                                          app=app, doc=d0)
+                if sysout:
+                    os.replace(sysout, out)
+                    results[tag] = out
+                    continue
+                print("  ⚠ [%s] 系统图导出失败，继续尝试常规流程" % tag, flush=True)
         chosen = None
         tried = []
         # 施工图字体本来就清晰 → 1:1；竣工图黑块来自比例太小 → 先放大。
@@ -758,11 +918,23 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
                 continue
             d = open_doc(path)
             try:
-                export_layout(d, raw, paper=paper, fix_shx=False, scale=trial_scale,
-                              plot_origin=(origin or (0, 0)) if trial_scale else None,
-                              verbose=verbose)
+                try:
+                    export_layout(d, raw, paper=paper, fix_shx=False, scale=trial_scale,
+                                  plot_origin=(origin or (0, 0)) if trial_scale else None,
+                                  verbose=verbose)
+                except RuntimeError as ex:
+                    # A4 索引式图纸用 A1 介质会空白；记录后继续试下一个比例
+                    if verbose:
+                        print("  [%s] scale=%s 导出失败: %s" % (tag, trial_scale, str(ex)[:60]), flush=True)
+                    d.Close(False)
+                    continue
             finally:
-                d.Close(False)
+                try:
+                    d.Close(False)
+                except Exception:
+                    pass
+            if not os.path.exists(raw) or os.path.getsize(raw) < 5000:
+                continue
             frame = detect_print_target_frame(raw, verbose) or detect_plan_frame(raw, verbose, min_rects=1)
             if plan_only and frame and not manual_clip:
                 sub = detect_plan_title_underline(raw, frame, verbose)
@@ -774,14 +946,27 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
                 chosen = (trial_scale, clip)
                 break
         if not chosen:
-            trial_scale, clip = tried[-1]
-            chosen = (trial_scale, clip)
-            print("  ⚠ [%s] 未能自动定位平面图框，已用最后候选；建议用 --%s-clip 或 inspect_frames.py 指定" %
-                  (tag, tag), flush=True)
+            if tried:
+                trial_scale, clip = tried[-1]
+                chosen = (trial_scale, clip)
+                print("  ⚠ [%s] 未能自动定位平面图框，已用最后候选；建议用 --%s-clip 或 inspect_frames.py 指定" %
+                      (tag, tag), flush=True)
+            else:
+                chosen = (0, None)
         use_scale, clip = chosen
         if verbose:
             print("  [%s] 最终比例=%s clip=%s" % (tag, use_scale or "1:1",
                   tuple(round(v) for v in clip) if clip else None), flush=True)
+        # 若所有比例都导出失败（A4 索引式图纸），回退到系统图导出
+        if not os.path.exists(raw) or os.path.getsize(raw) < 5000:
+            if system_fallback:
+                print("  [%s] 常规导出失败，尝试导出系统图（无平面图时）..." % tag, flush=True)
+                sysout = process_a4_index(path, work, text, label, preview, verbose)
+                if sysout:
+                    os.replace(sysout, out)
+                    results[tag] = out
+                    continue
+            raise RuntimeError("PDF 导出失败或内容为空: %s" % raw)
         stamp_a4_single(raw, text, label, out, clip=clip)
         results[tag] = out
         if preview:
@@ -814,6 +999,8 @@ def main():
     ap.add_argument("--plan-only", action="store_true",
                     help="只输出平面图本身(建筑+管道+标题+图例)，不含材料表/说明/系统图；"
                          "通过平面图标题双下划线自动定位子区域")
+    ap.add_argument("--system-fallback", action="store_true",
+                    help="无建筑平面图时(如A4索引式施工图)自动导出系统图 1:100 代替")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -873,7 +1060,7 @@ def main():
                 sj, jg, work, args.paper, args.sj_text, args.jg_text,
                 scale=args.scale, origin=origin, preview=args.preview,
                 verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
-                plan_only=args.plan_only)
+                plan_only=args.plan_only, system_fallback=args.system_fallback)
         else:
             sj_final, jg_final = process_pair(
                 sj, jg, work, args.paper, args.sj_text, args.jg_text,
