@@ -172,6 +172,16 @@ def export_layout(doc, out_pdf: str, paper: str = "A1", plot_type: int = 1,
               (lay.Name, paper, media, rotation, scale or "按图纸"), flush=True)
     lay.ConfigName = PDF_DRIVER
     lay.RefreshPlotDeviceInfo()
+    # 检测布局原生介质：A4/A3 索引式图纸（新型施工图）与本技能的 A1 拼版流程不兼容，
+    # 强行用 A1 介质会导出空白。给出明确提示。
+    try:
+        native = str(lay.CanonicalMediaName or "")
+        if native.upper().startswith("A4") and media != "User77":
+            print("  ⚠ 该DWG布局为 A4 索引式图纸（原生介质=%s），与 A1 拼版出图流程不兼容；"
+                  "此类图纸平面图在模型空间/为示意图，本技能暂不支持，请人工处理。" % native,
+                  flush=True)
+    except Exception:
+        pass
     lay.CanonicalMediaName = media
     lay.PlotRotation = rotation
     lay.StyleSheet = CTB
