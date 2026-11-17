@@ -579,8 +579,11 @@ def project_code(name: str) -> Optional[str]:
     用宽松正则：2字母 + 2数字 + 可选1字母 + 3~4位字母数字。
     """
     base = os.path.basename(name)
-    # 优先标准格式，兼容字母后跟 2~3 位
-    m = re.search(r"\b([A-Z]{2}\d{2}[A-Z]?[A-Z0-9]{2,4})\b", base, re.I)
+    # 优先从文件名开头匹配（施工图常见 "NC26E085友来昌..." 编号后直接跟中文，无分隔符）
+    m = re.match(r"^([A-Z]{2}\d{2}[A-Z]?[A-Z0-9]{2,4})(?=[-\s_(]|[^\x00-\x7f]|$)", base, re.I)
+    if not m:
+        # 回退：任意位置的独立编号（两侧为分隔符）
+        m = re.search(r"\b([A-Z]{2}\d{2}[A-Z]?[A-Z0-9]{2,4})\b", base, re.I)
     if not m:
         return None
     code = m.group(1).upper()
@@ -833,7 +836,7 @@ def process_a4_index(dwg: str, work: str, text: str, label: str,
     doc.close()
     if not xs:
         return None
-    clip = (min(xs)-15, min(ys)-15, max(xs)+15, max(ys)+15)
+    clip = (min(xs)-40, min(ys)-25, max(xs)+30, max(ys)+25)
     out = os.path.join(work, "sys_final.pdf")
     stamp_a4_single(raw, text, label, out, clip=clip)
     if verbose:
@@ -848,7 +851,7 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
                         sj_text: str, jg_text: str, scale: float = 4,
                         origin=None, preview=False, verbose=False,
                         sj_clip=None, jg_clip=None, plan_only=False,
-                        system_fallback=False):
+                        system_fallback=False, design_only=False):
     """【高分辨率图框打印模式】放大打印 → 定位目标图框 → 裁切到 A4。
 
     原理：SHX 大字体糊成黑块的根因是打印比例太小、分辨率不够（目标图框在
@@ -885,10 +888,10 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
     # 策略：优先 1:1（多数图纸文字本就清晰，如 J 盘样本）；
     # 只有 1:1 找不到「平面图框」（有矩形特征）时，才按 scale 放大重打——
     # 放大后其它图框被推出页面、目标框独占页面，SHX 也输出为清晰矢量。
-    for tag, path, text, label in [
-        ("sj", sj, sj_text, "设计方案1"),
-        ("jg", jg, jg_text, "变更方案1"),
-    ]:
+    pairs = [("sj", sj, sj_text, "设计方案1")]
+    if not design_only:
+        pairs.append(("jg", jg, jg_text, "变更方案1"))
+    for tag, path, text, label in pairs:
         manual_clip = sj_clip if tag == "sj" else jg_clip
         raw = os.path.join(work, "%s_scaled.pdf" % tag)
         out = os.path.join(work, "%s_final.pdf" % tag)
@@ -973,7 +976,7 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
             fitz.open(out)[0].get_pixmap(matrix=fitz.Matrix(0.6, 0.6)).save(
                 out.replace(".pdf", "_预览.png"))
     pythoncom.CoUninitialize()
-    return results["sj"], results["jg"]
+    return results["sj"], results.get("jg")
 
 
 def main():
@@ -999,6 +1002,8 @@ def main():
     ap.add_argument("--plan-only", action="store_true",
                     help="只输出平面图本身(建筑+管道+标题+图例)，不含材料表/说明/系统图；"
                          "通过平面图标题双下划线自动定位子区域")
+    ap.add_argument("--design-only", action="store_true",
+                    help="只输出设计方案单页（施工图单独提供时用）：不生成变更方案页，文件名用施工图编号")
     ap.add_argument("--system-fallback", action="store_true",
                     help="无建筑平面图时(如A4索引式施工图)自动导出系统图 1:100 代替")
     ap.add_argument("--verbose", action="store_true")
@@ -1026,8 +1031,11 @@ def main():
                           parse_clip(it.get("sj_clip")), parse_clip(it.get("jg_clip"))))
     elif len(args.dwg) == 2:
         pairs.append((args.dwg[0], args.dwg[1], None, sj_clip, jg_clip))
+    elif len(args.dwg) == 1:
+        # 只有施工图：只出设计方案单页
+        pairs.append((args.dwg[0], None, None, sj_clip, jg_clip))
     else:
-        ap.error("需提供两个 DWG（施工图、竣工图），或使用 --pairs")
+        ap.error("需提供 1 个施工图 DWG（只出设计方案）或 2 个 DWG（施工图+竣工图），或使用 --pairs")
 
     if not pairs:
         print("没有可处理的图纸对", flush=True)
@@ -1038,36 +1046,61 @@ def main():
         sj_layout = item[2] if len(item) > 2 else None
         pair_sj_clip = item[3] if len(item) > 3 else None
         pair_jg_clip = item[4] if len(item) > 4 else None
-        code = project_code(jg) or ("工程%02d" % idx)
-        base = os.path.splitext(os.path.basename(jg))[0]
-        # 名称取竣工图文件名去掉编号前缀部分
+        design_only = args.design_only or (jg is None)
+        # 单页设计方案时用施工图自身编号/名称命名
+        src_for_name = sj if design_only else jg
+        code = project_code(src_for_name) or ("工程%02d" % idx)
+        base = os.path.splitext(os.path.basename(src_for_name))[0]
         name = re.sub(r"^[A-Z]{2}\d{2}[A-Z]?\d{3}[-_ ]*", "", base, flags=re.I) or base
-        out_name = "%s-%s-变更方案附图.pdf" % (code, name)
+        out_name = "%s-%s-设计方案.pdf" % (code, name) if design_only else "%s-%s-变更方案附图.pdf" % (code, name)
         work = os.path.join(args.out_dir, "_work_%s" % code)
         os.makedirs(work, exist_ok=True)
         print("\n=== %s ===" % out_name, flush=True)
         if args.verbose:
             print("  竣工图编号: %s | 施工图: %s" %
                   (code, os.path.basename(sj)), flush=True)
-        if args.frame_print:
-            origin = None
-            if args.plot_origin:
-                try:
-                    origin = tuple(float(v) for v in args.plot_origin.replace("，", ",").split(","))
-                except ValueError:
-                    ap.error("--plot-origin 需为 x_mm,y_mm")
-            sj_final, jg_final = process_frame_print(
-                sj, jg, work, args.paper, args.sj_text, args.jg_text,
-                scale=args.scale, origin=origin, preview=args.preview,
-                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
-                plan_only=args.plan_only, system_fallback=args.system_fallback)
+        if design_only:
+            # 只有施工图：只生成设计方案单页（标签改为"设计方案1"）
+            sj_text = args.sj_text.rstrip("：: ") or "设计方案："
+            if args.frame_print:
+                origin = None
+                if args.plot_origin:
+                    try:
+                        origin = tuple(float(v) for v in args.plot_origin.replace("，", ",").split(","))
+                    except ValueError:
+                        ap.error("--plot-origin 需为 x_mm,y_mm")
+                sj_final, _ = process_frame_print(
+                    sj, sj, work, args.paper, sj_text, "", scale=args.scale,
+                    origin=origin, preview=args.preview, verbose=args.verbose,
+                    sj_clip=pair_sj_clip, jg_clip=None, plan_only=args.plan_only,
+                    system_fallback=args.system_fallback, design_only=True)
+            else:
+                sj_final, _ = process_pair(
+                    sj, sj, work, args.paper, sj_text, "",
+                    args.text_pos, args.preview, code=code, sj_layout=sj_layout,
+                    verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=None,
+                    a4_single=True)
+            merged = merge_pdfs([sj_final], os.path.join(args.out_dir, out_name))
         else:
-            sj_final, jg_final = process_pair(
-                sj, jg, work, args.paper, args.sj_text, args.jg_text,
-                args.text_pos, args.preview, code=code, sj_layout=sj_layout,
-                verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
-                a4_single=args.a4_single)
-        merged = merge_pdfs([sj_final, jg_final], os.path.join(args.out_dir, out_name))
+            if args.frame_print:
+                origin = None
+                if args.plot_origin:
+                    try:
+                        origin = tuple(float(v) for v in args.plot_origin.replace("，", ",").split(","))
+                    except ValueError:
+                        ap.error("--plot-origin 需为 x_mm,y_mm")
+                sj_final, jg_final = process_frame_print(
+                    sj, jg, work, args.paper, args.sj_text, args.jg_text,
+                    scale=args.scale, origin=origin, preview=args.preview,
+                    verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
+                    plan_only=args.plan_only, system_fallback=args.system_fallback)
+            else:
+                sj_final, jg_final = process_pair(
+                    sj, jg, work, args.paper, args.sj_text, args.jg_text,
+                    args.text_pos, args.preview, code=code, sj_layout=sj_layout,
+                    verbose=args.verbose, sj_clip=pair_sj_clip, jg_clip=pair_jg_clip,
+                    a4_single=args.a4_single)
+            merged = merge_pdfs([sj_final, jg_final], os.path.join(args.out_dir, out_name))
         if args.a4_single:
             print("完成（A4 单幅）: %s (%.0fKB)" % (merged, os.path.getsize(merged)/1024), flush=True)
         else:
