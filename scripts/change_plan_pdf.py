@@ -27,7 +27,7 @@ pairs.json 格式（多对）：
 """
 from __future__ import annotations
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 import argparse
 import json
@@ -257,6 +257,61 @@ def detect_plan_frame(pdf_path: str, verbose=False, min_rects=1):
     return (best[0], best[1], best[2], best[3])
 
 
+def detect_print_target_frame(pdf_path: str, verbose=False):
+    """在「请勿打印」索引页里定位真正要打印的图框（带 ✓ 打印N张 的那个）。
+
+    这类 DWG 把整本图纸拼在一张 A1 上：上半是带大 X 的"请勿打印"索引页，
+    下半是带对勾的「打印N张」目标图框。矢量框线杂乱难判，改用栅格投影：
+    取页面下半的暗像素，按连通行/列聚类，最大的暗块即目标图框（含其内平面图、
+    说明、材料表、标题栏，以及右侧的对勾与文字）。
+
+    返回 (x0,y0,x1,y1)；找不到返回 None。
+    """
+    import fitz
+    import numpy as np
+    d = fitz.open(pdf_path)
+    p = d[0]
+    W, H = p.rect.width, p.rect.height
+    z = 0.3
+    pix = p.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3).mean(2)
+    d.close()
+    h, w = img.shape
+    dark = img < 128
+    y0 = int(h * 0.5)
+    # 按x投影找下半页的暗列簇（目标框比大X的细线更"实"）
+    colsum = dark[y0:, :].sum(axis=0)
+    # 平滑后阈值
+    k = 5
+    sm = np.convolve(colsum, np.ones(k)/k, mode='same')
+    active = sm > 1.5
+    # 找最大连续段
+    segs = []
+    st = None
+    for i, v in enumerate(active):
+        if v and st is None:
+            st = i
+        elif not v and st is not None:
+            segs.append((st, i)); st = None
+    if st is not None:
+        segs.append((st, w))
+    if not segs:
+        return None
+    segs.sort(key=lambda s: -(s[1]-s[0]))
+    x0p, x1p = segs[0]
+    # 在该列范围内取暗行范围
+    sub = dark[y0:, x0p:x1p]
+    rowsum = sub.sum(axis=1)
+    rows = np.where(rowsum > 2)[0]
+    if len(rows) == 0:
+        return None
+    y0p = y0 + rows.min(); y1p = y0 + rows.max()
+    box = (x0p/z, y0p/z, x1p/z, y1p/z)
+    if verbose:
+        print("  打印目标框(栅格): %s" % (tuple(round(v) for v in box),), flush=True)
+    return box
+
+
 def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
     """在高分辨率打印的 PDF 中，用「平面图标题的双下划线」定位平面图区域。
 
@@ -274,7 +329,7 @@ def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
     hs = []
     for g in p.get_drawings():
         r = g["rect"]
-        if r.height < 3 and 50 < r.width < 300 and fr.contains(r):
+        if r.height < 3 and 35 < r.width < 300 and fr.contains(r):
             hs.append((r.x0, r.y0, r.x1))
     hs.sort(key=lambda h: (h[1], h[0]))
     pairs = []
@@ -283,7 +338,16 @@ def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
             gap = b[1] - a[1]
             if gap > 12:
                 break
-            if abs(a[0]-b[0]) < 6 and abs(a[2]-b[2]) < 6 and 3 < gap < 10:
+            if abs(a[0]-b[0]) < 6 and abs(a[2]-b[2]) < 6 and 1 < gap < 10:
+                # 排除材料表网格线：网格里同一x范围有十几条等间距平行线；
+                # 标题下划线是孤立的一对，上下40pt内没有更多同x范围的线
+                same_x = [h for h in hs if abs(h[0]-a[0])<6 and abs(h[2]-a[2])<6]
+                near = [h for h in same_x if a[1]-40 <= h[1] <= b[1]+40]
+                if len(near) > 4:
+                    continue
+                # 平面图标题在框左半；材料表通常在右半。排除右半的窄表格线。
+                if a[0] > fr.x0 + fr.width*0.58:
+                    continue
                 pairs.append((a, b))
     d.close()
     if not pairs:
@@ -299,7 +363,8 @@ def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
         b = a
     else:
         # 选最靠下、且左右端在框左半的一对（平面图在A2框左侧）
-        pairs.sort(key=lambda p: (p[0][0] > fr.x0 + fr.width*0.6, -p[0][1]))
+        pairs.sort(key=lambda p: (p[0][0] > fr.x0 + fr.width*0.6,
+                                  abs(p[0][1] - (fr.y0 + fr.height*0.5)), -p[0][1]))
         a, b = pairs[0]
     if verbose:
         print("  标题双下划线: x=%.0f..%.0f y=%.0f" % (a[0], a[2], a[1]), flush=True)
@@ -323,6 +388,9 @@ def detect_plan_title_underline(pdf_path: str, frame=None, verbose=False):
         bx0 = max(min(xs), ux0 - uw*0.8)
         bx1 = min(max(xs), ux1 + uw*1.5)
         by0 = min(ys)
+        # 左缘图框粗竖线: 若 bx0 与标题左端相差超过 1.5 倍标题宽，收紧到标题附近
+        if ux0 - bx0 > uw * 1.5:
+            bx0 = ux0 - uw * 1.5
     else:
         bx0, bx1, by0 = ux0 - uw, ux1 + uw, uy - 200
     # 图例在标题下方约 0.5~1 倍下划线宽
@@ -685,7 +753,7 @@ def process_frame_print(sj: str, jg: str, work: str, paper: str,
                               verbose=verbose)
             finally:
                 d.Close(False)
-            frame = detect_plan_frame(raw, verbose, min_rects=1)
+            frame = detect_print_target_frame(raw, verbose) or detect_plan_frame(raw, verbose, min_rects=1)
             if plan_only and frame and not manual_clip:
                 sub = detect_plan_title_underline(raw, frame, verbose)
                 clip = sub or frame
